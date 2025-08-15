@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime
 import inspect
 import re
 import warnings
@@ -25,7 +24,9 @@ from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.lowlevel.server import LifespanResultT, NotificationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import (
+    Annotations,
     AnyFunction,
+    CallToolRequestParams,
     ContentBlock,
     GetPromptResult,
     ToolAnnotations,
@@ -43,12 +44,13 @@ from starlette.routing import BaseRoute, Route
 import fastmcp
 import fastmcp.server
 from fastmcp.exceptions import DisabledError, NotFoundError
+from fastmcp.mcp_config import MCPConfig
 from fastmcp.prompts import Prompt, PromptManager
 from fastmcp.prompts.prompt import FunctionPrompt
 from fastmcp.resources import Resource, ResourceManager
 from fastmcp.resources.template import ResourceTemplate
-from fastmcp.server.auth.auth import OAuthProvider
-from fastmcp.server.auth.providers.bearer_env import EnvBearerAuthProvider
+from fastmcp.server.auth import AuthProvider
+from fastmcp.server.auth.registry import get_registered_provider
 from fastmcp.server.http import (
     StarletteWithLifespan,
     create_sse_app,
@@ -59,20 +61,28 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.settings import Settings
 from fastmcp.tools import ToolManager
 from fastmcp.tools.tool import FunctionTool, Tool, ToolResult
-from fastmcp.utilities.cache import TimedCache
-from fastmcp.utilities.cli import print_server_banner
+from fastmcp.tools.tool_transform import ToolTransformConfig
+from fastmcp.utilities.cli import log_server_banner
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.logging import get_logger
-from fastmcp.utilities.mcp_config import MCPConfig
 from fastmcp.utilities.types import NotSet, NotSetT
 
 if TYPE_CHECKING:
     from fastmcp.client import Client
     from fastmcp.client.transports import ClientTransport, ClientTransportT
+    from fastmcp.experimental.server.openapi import FastMCPOpenAPI as FastMCPOpenAPINew
+    from fastmcp.experimental.server.openapi.routing import (
+        ComponentFn as OpenAPIComponentFnNew,
+    )
+    from fastmcp.experimental.server.openapi.routing import RouteMap as RouteMapNew
+    from fastmcp.experimental.server.openapi.routing import (
+        RouteMapFn as OpenAPIRouteMapFnNew,
+    )
     from fastmcp.server.openapi import ComponentFn as OpenAPIComponentFn
     from fastmcp.server.openapi import FastMCPOpenAPI, RouteMap
     from fastmcp.server.openapi import RouteMapFn as OpenAPIRouteMapFn
     from fastmcp.server.proxy import FastMCPProxy
+
 logger = get_logger(__name__)
 
 DuplicateBehavior = Literal["warn", "error", "replace", "ignore"]
@@ -121,7 +131,7 @@ class FastMCP(Generic[LifespanResultT]):
         instructions: str | None = None,
         *,
         version: str | None = None,
-        auth: OAuthProvider | None = None,
+        auth: AuthProvider | None | NotSetT = NotSet,
         middleware: list[Middleware] | None = None,
         lifespan: (
             Callable[
@@ -130,17 +140,18 @@ class FastMCP(Generic[LifespanResultT]):
             ]
             | None
         ) = None,
-        tool_serializer: Callable[[Any], str] | None = None,
-        cache_expiration_seconds: float | None = None,
-        on_duplicate_tools: DuplicateBehavior | None = None,
-        on_duplicate_resources: DuplicateBehavior | None = None,
-        on_duplicate_prompts: DuplicateBehavior | None = None,
+        dependencies: list[str] | None = None,
         resource_prefix_format: Literal["protocol", "path"] | None = None,
         mask_error_details: bool | None = None,
         tools: list[Tool | Callable[..., Any]] | None = None,
-        dependencies: list[str] | None = None,
+        tool_transformations: dict[str, ToolTransformConfig] | None = None,
+        tool_serializer: Callable[[Any], str] | None = None,
         include_tags: set[str] | None = None,
         exclude_tags: set[str] | None = None,
+        include_fastmcp_meta: bool | None = None,
+        on_duplicate_tools: DuplicateBehavior | None = None,
+        on_duplicate_resources: DuplicateBehavior | None = None,
+        on_duplicate_prompts: DuplicateBehavior | None = None,
         # ---
         # ---
         # --- The following arguments are DEPRECATED ---
@@ -160,13 +171,12 @@ class FastMCP(Generic[LifespanResultT]):
             resource_prefix_format or fastmcp.settings.resource_prefix_format
         )
 
-        self._cache = TimedCache(
-            expiration=datetime.timedelta(seconds=cache_expiration_seconds or 0)
-        )
         self._additional_http_routes: list[BaseRoute] = []
+        self._mounted_servers: list[MountedServer] = []
         self._tool_manager = ToolManager(
             duplicate_behavior=on_duplicate_tools,
             mask_error_details=mask_error_details,
+            transformations=tool_transformations,
         )
         self._resource_manager = ResourceManager(
             duplicate_behavior=on_duplicate_resources,
@@ -190,9 +200,14 @@ class FastMCP(Generic[LifespanResultT]):
             lifespan=_lifespan_wrapper(self, lifespan),
         )
 
-        if auth is None and fastmcp.settings.default_auth_provider == "bearer_env":
-            auth = EnvBearerAuthProvider()
-        self.auth = auth
+        # if auth is `NotSet`, try to create a provider from the environment
+        if auth is NotSet:
+            if fastmcp.settings.server_auth is not None:
+                provider_cls = get_registered_provider(fastmcp.settings.server_auth)
+                auth = provider_cls()
+            else:
+                auth = None
+        self.auth = cast(AuthProvider | None, auth)
 
         if tools:
             for tool in tools:
@@ -208,6 +223,12 @@ class FastMCP(Generic[LifespanResultT]):
         # Set up MCP protocol handlers
         self._setup_handlers()
         self.dependencies = dependencies or fastmcp.settings.server_dependencies
+
+        self.include_fastmcp_meta = (
+            include_fastmcp_meta
+            if include_fastmcp_meta is not None
+            else fastmcp.settings.include_fastmcp_meta
+        )
 
         # handle deprecated settings
         self._handle_deprecated_settings(
@@ -282,6 +303,10 @@ class FastMCP(Generic[LifespanResultT]):
     @property
     def instructions(self) -> str | None:
         return self._mcp_server.instructions
+
+    @property
+    def version(self) -> str | None:
+        return self._mcp_server.version
 
     async def run_async(
         self,
@@ -407,7 +432,10 @@ class FastMCP(Generic[LifespanResultT]):
         methods: list[str],
         name: str | None = None,
         include_in_schema: bool = True,
-    ):
+    ) -> Callable[
+        [Callable[[Request], Awaitable[Response]]],
+        Callable[[Request], Awaitable[Response]],
+    ]:
         """
         Decorator to register a custom HTTP route on the FastMCP server.
 
@@ -448,12 +476,36 @@ class FastMCP(Generic[LifespanResultT]):
 
         return decorator
 
+    def _get_additional_http_routes(self) -> list[BaseRoute]:
+        """Get all additional HTTP routes including from mounted servers.
+
+        Returns a list of all custom HTTP routes from this server and
+        recursively from all mounted servers.
+
+        Returns:
+            List of Starlette BaseRoute objects
+        """
+        routes = list(self._additional_http_routes)
+
+        # Recursively get routes from mounted servers
+        for mounted_server in self._mounted_servers:
+            mounted_routes = mounted_server.server._get_additional_http_routes()
+            routes.extend(mounted_routes)
+
+        return routes
+
     async def _mcp_list_tools(self) -> list[MCPTool]:
         logger.debug("Handler called: list_tools")
 
         async with fastmcp.server.context.Context(fastmcp=self):
             tools = await self._list_tools()
-            return [tool.to_mcp_tool(name=tool.key) for tool in tools]
+            return [
+                tool.to_mcp_tool(
+                    name=tool.key,
+                    include_fastmcp_meta=self.include_fastmcp_meta,
+                )
+                for tool in tools
+            ]
 
     async def _list_tools(self) -> list[Tool]:
         """
@@ -492,7 +544,11 @@ class FastMCP(Generic[LifespanResultT]):
         async with fastmcp.server.context.Context(fastmcp=self):
             resources = await self._list_resources()
             return [
-                resource.to_mcp_resource(uri=resource.key) for resource in resources
+                resource.to_mcp_resource(
+                    uri=resource.key,
+                    include_fastmcp_meta=self.include_fastmcp_meta,
+                )
+                for resource in resources
             ]
 
     async def _list_resources(self) -> list[Resource]:
@@ -533,7 +589,10 @@ class FastMCP(Generic[LifespanResultT]):
         async with fastmcp.server.context.Context(fastmcp=self):
             templates = await self._list_resource_templates()
             return [
-                template.to_mcp_template(uriTemplate=template.key)
+                template.to_mcp_template(
+                    uriTemplate=template.key,
+                    include_fastmcp_meta=self.include_fastmcp_meta,
+                )
                 for template in templates
             ]
 
@@ -574,7 +633,13 @@ class FastMCP(Generic[LifespanResultT]):
 
         async with fastmcp.server.context.Context(fastmcp=self):
             prompts = await self._list_prompts()
-            return [prompt.to_mcp_prompt(name=prompt.key) for prompt in prompts]
+            return [
+                prompt.to_mcp_prompt(
+                    name=prompt.key,
+                    include_fastmcp_meta=self.include_fastmcp_meta,
+                )
+                for prompt in prompts
+            ]
 
     async def _list_prompts(self) -> list[Prompt]:
         """
@@ -650,7 +715,7 @@ class FastMCP(Generic[LifespanResultT]):
                 key=context.message.name, arguments=context.message.arguments or {}
             )
 
-        mw_context = MiddlewareContext(
+        mw_context = MiddlewareContext[CallToolRequestParams](
             message=mcp.types.CallToolRequestParams(name=key, arguments=arguments),
             source="client",
             type="request",
@@ -759,7 +824,7 @@ class FastMCP(Generic[LifespanResultT]):
         )
         return await self._apply_middleware(mw_context, _handler)
 
-    def add_tool(self, tool: Tool) -> None:
+    def add_tool(self, tool: Tool) -> Tool:
         """Add a tool to the server.
 
         The tool function can optionally request a Context object by adding a parameter
@@ -767,9 +832,11 @@ class FastMCP(Generic[LifespanResultT]):
 
         Args:
             tool: The Tool instance to register
+
+        Returns:
+            The tool instance that was added to the server.
         """
         self._tool_manager.add_tool(tool)
-        self._cache.clear()
 
         # Send notification if we're in a request context
         try:
@@ -779,6 +846,8 @@ class FastMCP(Generic[LifespanResultT]):
             context._queue_tool_list_changed()  # type: ignore[private-use]
         except RuntimeError:
             pass  # No context available
+
+        return tool
 
     def remove_tool(self, name: str) -> None:
         """Remove a tool from the server.
@@ -790,7 +859,6 @@ class FastMCP(Generic[LifespanResultT]):
             NotFoundError: If the tool is not found
         """
         self._tool_manager.remove_tool(name)
-        self._cache.clear()
 
         # Send notification if we're in a request context
         try:
@@ -800,6 +868,16 @@ class FastMCP(Generic[LifespanResultT]):
             context._queue_tool_list_changed()  # type: ignore[private-use]
         except RuntimeError:
             pass  # No context available
+
+    def add_tool_transformation(
+        self, tool_name: str, transformation: ToolTransformConfig
+    ) -> None:
+        """Add a tool transformation."""
+        self._tool_manager.add_tool_transformation(tool_name, transformation)
+
+    def remove_tool_transformation(self, tool_name: str) -> None:
+        """Remove a tool transformation."""
+        self._tool_manager.remove_tool_transformation(tool_name)
 
     @overload
     def tool(
@@ -813,6 +891,7 @@ class FastMCP(Generic[LifespanResultT]):
         output_schema: dict[str, Any] | None | NotSetT = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
+        meta: dict[str, Any] | None = None,
         enabled: bool | None = None,
     ) -> FunctionTool: ...
 
@@ -828,6 +907,7 @@ class FastMCP(Generic[LifespanResultT]):
         output_schema: dict[str, Any] | None | NotSetT = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
+        meta: dict[str, Any] | None = None,
         enabled: bool | None = None,
     ) -> Callable[[AnyFunction], FunctionTool]: ...
 
@@ -842,6 +922,7 @@ class FastMCP(Generic[LifespanResultT]):
         output_schema: dict[str, Any] | None | NotSetT = NotSet,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
+        meta: dict[str, Any] | None = None,
         enabled: bool | None = None,
     ) -> Callable[[AnyFunction], FunctionTool] | FunctionTool:
         """Decorator to register a tool.
@@ -865,6 +946,7 @@ class FastMCP(Generic[LifespanResultT]):
             output_schema: Optional JSON schema for the tool's output
             annotations: Optional annotations about the tool's behavior
             exclude_args: Optional list of argument names to exclude from the tool schema
+            meta: Optional meta information about the tool
             enabled: Optional boolean to enable or disable the tool
 
         Examples:
@@ -923,6 +1005,7 @@ class FastMCP(Generic[LifespanResultT]):
                 output_schema=output_schema,
                 annotations=annotations,
                 exclude_args=exclude_args,
+                meta=meta,
                 serializer=self._tool_serializer,
                 enabled=enabled,
             )
@@ -955,18 +1038,20 @@ class FastMCP(Generic[LifespanResultT]):
             output_schema=output_schema,
             annotations=annotations,
             exclude_args=exclude_args,
+            meta=meta,
             enabled=enabled,
         )
 
-    def add_resource(self, resource: Resource) -> None:
+    def add_resource(self, resource: Resource) -> Resource:
         """Add a resource to the server.
 
         Args:
             resource: A Resource instance to add
-        """
 
+        Returns:
+            The resource instance that was added to the server.
+        """
         self._resource_manager.add_resource(resource)
-        self._cache.clear()
 
         # Send notification if we're in a request context
         try:
@@ -977,11 +1062,16 @@ class FastMCP(Generic[LifespanResultT]):
         except RuntimeError:
             pass  # No context available
 
-    def add_template(self, template: ResourceTemplate) -> None:
+        return resource
+
+    def add_template(self, template: ResourceTemplate) -> ResourceTemplate:
         """Add a resource template to the server.
 
         Args:
             template: A ResourceTemplate instance to add
+
+        Returns:
+            The template instance that was added to the server.
         """
         self._resource_manager.add_template(template)
 
@@ -993,6 +1083,8 @@ class FastMCP(Generic[LifespanResultT]):
             context._queue_resource_list_changed()  # type: ignore[private-use]
         except RuntimeError:
             pass  # No context available
+
+        return template
 
     def add_resource_fn(
         self,
@@ -1031,7 +1123,6 @@ class FastMCP(Generic[LifespanResultT]):
             mime_type=mime_type,
             tags=tags,
         )
-        self._cache.clear()
 
     def resource(
         self,
@@ -1043,6 +1134,8 @@ class FastMCP(Generic[LifespanResultT]):
         mime_type: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
+        annotations: Annotations | dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> Callable[[AnyFunction], Resource | ResourceTemplate]:
         """Decorator to register a function as a resource.
 
@@ -1066,6 +1159,8 @@ class FastMCP(Generic[LifespanResultT]):
             mime_type: Optional MIME type for the resource
             tags: Optional set of tags for categorizing the resource
             enabled: Optional boolean to enable or disable the resource
+            annotations: Optional annotations about the resource's behavior
+            meta: Optional meta information about the resource
 
         Examples:
             Register a resource with a custom name:
@@ -1094,6 +1189,9 @@ class FastMCP(Generic[LifespanResultT]):
                 return f"Weather for {city}: {data}"
             ```
         """
+        if isinstance(annotations, dict):
+            annotations = Annotations(**annotations)
+
         # Check if user passed function directly instead of calling decorator
         if inspect.isroutine(uri):
             raise TypeError(
@@ -1135,6 +1233,8 @@ class FastMCP(Generic[LifespanResultT]):
                     mime_type=mime_type,
                     tags=tags,
                     enabled=enabled,
+                    annotations=annotations,
+                    meta=meta,
                 )
                 self.add_template(template)
                 return template
@@ -1148,6 +1248,8 @@ class FastMCP(Generic[LifespanResultT]):
                     mime_type=mime_type,
                     tags=tags,
                     enabled=enabled,
+                    annotations=annotations,
+                    meta=meta,
                 )
                 self.add_resource(resource)
                 return resource
@@ -1159,14 +1261,16 @@ class FastMCP(Generic[LifespanResultT]):
 
         return decorator
 
-    def add_prompt(self, prompt: Prompt) -> None:
+    def add_prompt(self, prompt: Prompt) -> Prompt:
         """Add a prompt to the server.
 
         Args:
             prompt: A Prompt instance to add
+
+        Returns:
+            The prompt instance that was added to the server.
         """
         self._prompt_manager.add_prompt(prompt)
-        self._cache.clear()
 
         # Send notification if we're in a request context
         try:
@@ -1176,6 +1280,8 @@ class FastMCP(Generic[LifespanResultT]):
             context._queue_prompt_list_changed()  # type: ignore[private-use]
         except RuntimeError:
             pass  # No context available
+
+        return prompt
 
     @overload
     def prompt(
@@ -1187,6 +1293,7 @@ class FastMCP(Generic[LifespanResultT]):
         description: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> FunctionPrompt: ...
 
     @overload
@@ -1199,6 +1306,7 @@ class FastMCP(Generic[LifespanResultT]):
         description: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> Callable[[AnyFunction], FunctionPrompt]: ...
 
     def prompt(
@@ -1210,6 +1318,7 @@ class FastMCP(Generic[LifespanResultT]):
         description: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> Callable[[AnyFunction], FunctionPrompt] | FunctionPrompt:
         """Decorator to register a prompt.
 
@@ -1230,6 +1339,7 @@ class FastMCP(Generic[LifespanResultT]):
             description: Optional description of what the prompt does
             tags: Optional set of tags for categorizing the prompt
             enabled: Optional boolean to enable or disable the prompt
+            meta: Optional meta information about the prompt
 
         Examples:
 
@@ -1307,6 +1417,7 @@ class FastMCP(Generic[LifespanResultT]):
                 description=description,
                 tags=tags,
                 enabled=enabled,
+                meta=meta,
             )
             self.add_prompt(prompt)
 
@@ -1336,6 +1447,7 @@ class FastMCP(Generic[LifespanResultT]):
             description=description,
             tags=tags,
             enabled=enabled,
+            meta=meta,
         )
 
     async def run_stdio_async(self, show_banner: bool = True) -> None:
@@ -1343,7 +1455,7 @@ class FastMCP(Generic[LifespanResultT]):
 
         # Display server banner
         if show_banner:
-            print_server_banner(
+            log_server_banner(
                 server=self,
                 transport="stdio",
             )
@@ -1368,6 +1480,7 @@ class FastMCP(Generic[LifespanResultT]):
         path: str | None = None,
         uvicorn_config: dict[str, Any] | None = None,
         middleware: list[ASGIMiddleware] | None = None,
+        stateless_http: bool | None = None,
     ) -> None:
         """Run the server using HTTP transport.
 
@@ -1378,6 +1491,8 @@ class FastMCP(Generic[LifespanResultT]):
             log_level: Log level for the server (defaults to settings.log_level)
             path: Path for the endpoint (defaults to settings.streamable_http_path or settings.sse_path)
             uvicorn_config: Additional configuration for the Uvicorn server
+            middleware: A list of middleware to apply to the app
+            stateless_http: Whether to use stateless HTTP (defaults to settings.stateless_http)
         """
 
         host = host or self._deprecated_settings.host
@@ -1386,7 +1501,12 @@ class FastMCP(Generic[LifespanResultT]):
             log_level or self._deprecated_settings.log_level
         ).lower()
 
-        app = self.http_app(path=path, transport=transport, middleware=middleware)
+        app = self.http_app(
+            path=path,
+            transport=transport,
+            middleware=middleware,
+            stateless_http=stateless_http,
+        )
 
         # Get the path for the server URL
         server_path = (
@@ -1397,14 +1517,13 @@ class FastMCP(Generic[LifespanResultT]):
 
         # Display server banner
         if show_banner:
-            print_server_banner(
+            log_server_banner(
                 server=self,
                 transport=transport,
                 host=host,
                 port=port,
                 path=server_path,
             )
-
         _uvicorn_config_from_user = uvicorn_config or {}
 
         config_kwargs: dict[str, Any] = {
@@ -1636,8 +1755,6 @@ class FastMCP(Generic[LifespanResultT]):
             resource_separator: Deprecated. Separator character for resource URIs.
             prompt_separator: Deprecated. Separator character for prompt names.
         """
-        from fastmcp import Client
-        from fastmcp.client.transports import FastMCPTransport
         from fastmcp.server.proxy import FastMCPProxy
 
         # Deprecated since 2.9.0
@@ -1690,7 +1807,7 @@ class FastMCP(Generic[LifespanResultT]):
             as_proxy = server._has_lifespan
 
         if as_proxy and not isinstance(server, FastMCPProxy):
-            server = FastMCPProxy(Client(transport=FastMCPTransport(server)))
+            server = FastMCP.as_proxy(server)
 
         # Delegate mounting to all three managers
         mounted_server = MountedServer(
@@ -1698,11 +1815,10 @@ class FastMCP(Generic[LifespanResultT]):
             server=server,
             resource_prefix_format=self.resource_prefix_format,
         )
+        self._mounted_servers.append(mounted_server)
         self._tool_manager.mount(mounted_server)
         self._resource_manager.mount(mounted_server)
         self._prompt_manager.mount(mounted_server)
-
-        self._cache.clear()
 
     async def import_server(
         self,
@@ -1795,7 +1911,7 @@ class FastMCP(Generic[LifespanResultT]):
         # Import tools from the server
         for key, tool in (await server.get_tools()).items():
             if prefix:
-                tool = tool.with_key(f"{prefix}_{key}")
+                tool = tool.model_copy(key=f"{prefix}_{key}")
             self._tool_manager.add_tool(tool)
 
         # Import resources and templates from the server
@@ -1804,7 +1920,9 @@ class FastMCP(Generic[LifespanResultT]):
                 resource_key = add_resource_prefix(
                     key, prefix, self.resource_prefix_format
                 )
-                resource = resource.with_key(resource_key)
+                resource = resource.model_copy(
+                    update={"name": f"{prefix}_{resource.name}"}, key=resource_key
+                )
             self._resource_manager.add_resource(resource)
 
         for key, template in (await server.get_resource_templates()).items():
@@ -1812,13 +1930,15 @@ class FastMCP(Generic[LifespanResultT]):
                 template_key = add_resource_prefix(
                     key, prefix, self.resource_prefix_format
                 )
-                template = template.with_key(template_key)
+                template = template.model_copy(
+                    update={"name": f"{prefix}_{template.name}"}, key=template_key
+                )
             self._resource_manager.add_template(template)
 
         # Import prompts from the server
         for key, prompt in (await server.get_prompts()).items():
             if prefix:
-                prompt = prompt.with_key(f"{prefix}_{key}")
+                prompt = prompt.model_copy(key=f"{prefix}_{key}")
             self._prompt_manager.add_prompt(prompt)
 
         if prefix:
@@ -1826,54 +1946,71 @@ class FastMCP(Generic[LifespanResultT]):
         else:
             logger.debug(f"Imported server {server.name}")
 
-        self._cache.clear()
-
     @classmethod
     def from_openapi(
         cls,
         openapi_spec: dict[str, Any],
         client: httpx.AsyncClient,
-        route_maps: list[RouteMap] | None = None,
-        route_map_fn: OpenAPIRouteMapFn | None = None,
-        mcp_component_fn: OpenAPIComponentFn | None = None,
+        route_maps: list[RouteMap] | list[RouteMapNew] | None = None,
+        route_map_fn: OpenAPIRouteMapFn | OpenAPIRouteMapFnNew | None = None,
+        mcp_component_fn: OpenAPIComponentFn | OpenAPIComponentFnNew | None = None,
         mcp_names: dict[str, str] | None = None,
         tags: set[str] | None = None,
         **settings: Any,
-    ) -> FastMCPOpenAPI:
+    ) -> FastMCPOpenAPI | FastMCPOpenAPINew:
         """
         Create a FastMCP server from an OpenAPI specification.
         """
-        from .openapi import FastMCPOpenAPI
 
-        return FastMCPOpenAPI(
-            openapi_spec=openapi_spec,
-            client=client,
-            route_maps=route_maps,
-            route_map_fn=route_map_fn,
-            mcp_component_fn=mcp_component_fn,
-            mcp_names=mcp_names,
-            tags=tags,
-            **settings,
-        )
+        # Check if experimental parser is enabled
+        if fastmcp.settings.experimental.enable_new_openapi_parser:
+            from fastmcp.experimental.server.openapi import FastMCPOpenAPI
+
+            return FastMCPOpenAPI(
+                openapi_spec=openapi_spec,
+                client=client,
+                route_maps=cast(Any, route_maps),
+                route_map_fn=cast(Any, route_map_fn),
+                mcp_component_fn=cast(Any, mcp_component_fn),
+                mcp_names=mcp_names,
+                tags=tags,
+                **settings,
+            )
+        else:
+            logger.info(
+                "Using legacy OpenAPI parser. To use the new parser, set "
+                "FASTMCP_EXPERIMENTAL_ENABLE_NEW_OPENAPI_PARSER=true. The new parser "
+                "was introduced for testing in 2.11 and will become the default soon."
+            )
+            from .openapi import FastMCPOpenAPI
+
+            return FastMCPOpenAPI(
+                openapi_spec=openapi_spec,
+                client=client,
+                route_maps=cast(Any, route_maps),
+                route_map_fn=cast(Any, route_map_fn),
+                mcp_component_fn=cast(Any, mcp_component_fn),
+                mcp_names=mcp_names,
+                tags=tags,
+                **settings,
+            )
 
     @classmethod
     def from_fastapi(
         cls,
         app: Any,
         name: str | None = None,
-        route_maps: list[RouteMap] | None = None,
-        route_map_fn: OpenAPIRouteMapFn | None = None,
-        mcp_component_fn: OpenAPIComponentFn | None = None,
+        route_maps: list[RouteMap] | list[RouteMapNew] | None = None,
+        route_map_fn: OpenAPIRouteMapFn | OpenAPIRouteMapFnNew | None = None,
+        mcp_component_fn: OpenAPIComponentFn | OpenAPIComponentFnNew | None = None,
         mcp_names: dict[str, str] | None = None,
         httpx_client_kwargs: dict[str, Any] | None = None,
         tags: set[str] | None = None,
         **settings: Any,
-    ) -> FastMCPOpenAPI:
+    ) -> FastMCPOpenAPI | FastMCPOpenAPINew:
         """
         Create a FastMCP server from a FastAPI application.
         """
-
-        from .openapi import FastMCPOpenAPI
 
         if httpx_client_kwargs is None:
             httpx_client_kwargs = {}
@@ -1886,29 +2023,54 @@ class FastMCP(Generic[LifespanResultT]):
 
         name = name or app.title
 
-        return FastMCPOpenAPI(
-            openapi_spec=app.openapi(),
-            client=client,
-            name=name,
-            route_maps=route_maps,
-            route_map_fn=route_map_fn,
-            mcp_component_fn=mcp_component_fn,
-            mcp_names=mcp_names,
-            tags=tags,
-            **settings,
-        )
+        # Check if experimental parser is enabled
+        if fastmcp.settings.experimental.enable_new_openapi_parser:
+            from fastmcp.experimental.server.openapi import FastMCPOpenAPI
+
+            return FastMCPOpenAPI(
+                openapi_spec=app.openapi(),
+                client=client,
+                name=name,
+                route_maps=cast(Any, route_maps),
+                route_map_fn=cast(Any, route_map_fn),
+                mcp_component_fn=cast(Any, mcp_component_fn),
+                mcp_names=mcp_names,
+                tags=tags,
+                **settings,
+            )
+        else:
+            logger.info(
+                "Using legacy OpenAPI parser. To use the new parser, set "
+                "FASTMCP_EXPERIMENTAL_ENABLE_NEW_OPENAPI_PARSER=true. The new parser "
+                "was introduced for testing in 2.11 and will become the default soon."
+            )
+            from .openapi import FastMCPOpenAPI
+
+            return FastMCPOpenAPI(
+                openapi_spec=app.openapi(),
+                client=client,
+                name=name,
+                route_maps=cast(Any, route_maps),
+                route_map_fn=cast(Any, route_map_fn),
+                mcp_component_fn=cast(Any, mcp_component_fn),
+                mcp_names=mcp_names,
+                tags=tags,
+                **settings,
+            )
 
     @classmethod
     def as_proxy(
         cls,
-        backend: Client[ClientTransportT]
-        | ClientTransport
-        | FastMCP[Any]
-        | AnyUrl
-        | Path
-        | MCPConfig
-        | dict[str, Any]
-        | str,
+        backend: (
+            Client[ClientTransportT]
+            | ClientTransport
+            | FastMCP[Any]
+            | AnyUrl
+            | Path
+            | MCPConfig
+            | dict[str, Any]
+            | str
+        ),
         **settings: Any,
     ) -> FastMCPProxy:
         """Create a FastMCP proxy server for the given backend.
@@ -1919,14 +2081,43 @@ class FastMCP(Generic[LifespanResultT]):
         `fastmcp.client.Client` constructor.
         """
         from fastmcp.client.client import Client
-        from fastmcp.server.proxy import FastMCPProxy
+        from fastmcp.server.proxy import FastMCPProxy, ProxyClient
 
         if isinstance(backend, Client):
             client = backend
-        else:
-            client = Client(backend)
+            # Session strategy based on client connection state:
+            # - Connected clients: reuse existing session for all requests
+            # - Disconnected clients: create fresh sessions per request for isolation
+            if client.is_connected():
+                from fastmcp.utilities.logging import get_logger
 
-        return FastMCPProxy(client=client, **settings)
+                logger = get_logger(__name__)
+                logger.info(
+                    "Proxy detected connected client - reusing existing session for all requests. "
+                    "This may cause context mixing in concurrent scenarios."
+                )
+
+                # Reuse sessions - return the same client instance
+                def reuse_client_factory():
+                    return client
+
+                client_factory = reuse_client_factory
+            else:
+                # Fresh sessions per request
+                def fresh_client_factory():
+                    return client.new()
+
+                client_factory = fresh_client_factory
+        else:
+            base_client = ProxyClient(backend)
+
+            # Fresh client created from transport - use fresh sessions per request
+            def proxy_client_factory():
+                return base_client.new()
+
+            client_factory = proxy_client_factory
+
+        return FastMCPProxy(client_factory=client_factory, **settings)
 
     @classmethod
     def from_client(

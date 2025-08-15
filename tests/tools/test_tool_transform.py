@@ -13,7 +13,11 @@ from fastmcp.client.client import Client
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import Tool, forward, forward_raw
 from fastmcp.tools.tool import FunctionTool, ToolResult
-from fastmcp.tools.tool_transform import ArgTransform, TransformedTool
+from fastmcp.tools.tool_transform import (
+    ArgTransform,
+    ToolTransformConfig,
+    TransformedTool,
+)
 
 
 def get_property(tool: Tool, name: str) -> dict[str, Any]:
@@ -190,6 +194,31 @@ async def test_hide_required_param_with_user_default_works():
     # Should pass required_param=5 and optional_param=20 to parent
     result = await new_tool.run(arguments={"optional_param": 20})
     assert result.structured_content == {"result": 25}
+
+
+async def test_hidden_param_prunes_defs():
+    class VisibleType(BaseModel):
+        x: int
+
+    class HiddenType(BaseModel):
+        y: int
+
+    @Tool.from_function
+    def tool_with_refs(a: VisibleType, b: HiddenType | None = None) -> int:
+        return a.x + (b.y if b else 0)
+
+    # Hide parameter 'b'
+    new_tool = Tool.from_tool(
+        tool_with_refs, transform_args={"b": ArgTransform(hide=True)}
+    )
+
+    schema = new_tool.parameters
+    # Only 'a' should be visible
+    assert list(schema["properties"].keys()) == ["a"]
+    # $defs should only contain VisibleType, not HiddenType
+    defs = schema.get("$defs", {})
+    assert "VisibleType" in defs
+    assert "HiddenType" not in defs
 
 
 async def test_forward_with_argument_mapping(add_tool):
@@ -384,14 +413,32 @@ async def test_forward_raw_outside_context_raises_error():
         await forward_raw(new_x=1, old_y=2)
 
 
+def test_transform_args_with_parent_defaults():
+    """Test that transform_args with parent defaults works."""
+
+    class CoolModel(BaseModel):
+        x: int = 10
+
+    def parent_tool(cool_model: CoolModel) -> int:
+        return cool_model.x
+
+    tool = Tool.from_function(parent_tool)
+
+    new_tool = Tool.from_tool(tool)
+
+    assert new_tool.parameters["$defs"] == tool.parameters["$defs"]
+
+
 def test_transform_args_validation_unknown_arg(add_tool):
     """Test that transform_args with unknown arguments raises ValueError."""
     with pytest.raises(
         ValueError, match="Unknown arguments in transform_args: unknown_param"
-    ):
+    ) as exc_info:
         Tool.from_tool(
             add_tool, transform_args={"unknown_param": ArgTransform(name="new_name")}
         )
+
+    assert "`add`" in str(exc_info.value)
 
 
 def test_transform_args_creates_duplicate_names(add_tool):
@@ -725,7 +772,7 @@ class TestProxy:
     def proxy_server(self, mcp_server: FastMCP) -> FastMCP:
         from fastmcp.client.transports import FastMCPTransport
 
-        proxy = FastMCP.as_proxy(Client(transport=FastMCPTransport(mcp_server)))
+        proxy = FastMCP.as_proxy(FastMCPTransport(mcp_server))
         return proxy
 
     async def test_transform_proxy(self, proxy_server: FastMCP):
@@ -973,7 +1020,12 @@ class TestEnableDisable:
         new_add = Tool.from_tool(add, name="new_add")
         mcp.add_tool(new_add)
 
-        assert new_add.enabled
+        # the new tool inherits the disabled state from the parent tool
+        assert new_add.enabled is False
+
+        new_add.enable()
+        assert new_add.enabled is True
+        assert add.enabled is False
 
         async with Client(mcp) as client:
             tools = await client.list_tools()
@@ -1071,15 +1123,15 @@ class TestTransformToolOutputSchema:
         assert new_tool.output_schema == expected_schema
         assert new_tool.output_schema == base_string_tool.output_schema
 
-    def test_transform_with_explicit_output_schema_false(self, base_string_tool):
-        """Test that output_schema=False disables structured output."""
-        new_tool = Tool.from_tool(base_string_tool, output_schema=False)
+    def test_transform_with_explicit_output_schema_none(self, base_string_tool):
+        """Test that output_schema=None sets output schema to None."""
+        new_tool = Tool.from_tool(base_string_tool, output_schema=None)
 
         assert new_tool.output_schema is None
 
-    async def test_transform_output_schema_false_runtime(self, base_string_tool):
-        """Test runtime behavior with output_schema=False."""
-        new_tool = Tool.from_tool(base_string_tool, output_schema=False)
+    async def test_transform_output_schema_none_runtime(self, base_string_tool):
+        """Test runtime behavior with output_schema=None."""
+        new_tool = Tool.from_tool(base_string_tool, output_schema=None)
 
         # Debug: check that output_schema is actually None
         assert new_tool.output_schema is None, (
@@ -1087,7 +1139,8 @@ class TestTransformToolOutputSchema:
         )
 
         result = await new_tool.run({"x": 5})
-        assert result.structured_content is None
+        # Even with output_schema=None, structured content should be generated via fallback logic
+        assert result.structured_content == {"result": "Result: 5"}
         assert result.content[0].text == "Result: 5"  # type: ignore[attr-defined]
 
     def test_transform_with_explicit_output_schema_dict(self, base_string_tool):
@@ -1141,7 +1194,7 @@ class TestTransformToolOutputSchema:
 
         result = await new_tool.run({"x": 3})
         # Should wrap string result
-        assert result.structured_content == {"result": 'Custom: {\n  "value": 3\n}'}
+        assert result.structured_content == {"result": 'Custom: {"value":3}'}
 
     def test_transform_custom_function_fallback_to_parent(self, base_string_tool):
         """Test that custom function without output annotation falls back to parent."""
@@ -1259,25 +1312,27 @@ class TestTransformToolOutputSchema:
         expected_schema = TypeAdapter(dict[str, str]).json_schema()
         assert new_tool.output_schema == expected_schema
 
-    async def test_transform_output_schema_none_vs_false(self, base_string_tool):
-        """Test None vs False behavior for output_schema in transforms."""
-        # None (default) should use smart fallback (inherit from parent)
-        tool_none = Tool.from_tool(base_string_tool)  # default output_schema=None
-        assert tool_none.output_schema == base_string_tool.output_schema  # Inherits
+    async def test_transform_output_schema_default_vs_none(self, base_string_tool):
+        """Test default (NotSet) vs explicit None behavior for output_schema in transforms."""
+        # Default (NotSet) should use smart fallback (inherit from parent)
+        tool_default = Tool.from_tool(base_string_tool)  # default output_schema=NotSet
+        assert tool_default.output_schema == base_string_tool.output_schema  # Inherits
 
-        # False should explicitly disable
-        tool_false = Tool.from_tool(base_string_tool, output_schema=False)
-        assert tool_false.output_schema is None
+        # None should explicitly set output_schema to None but still generate structured content via fallback
+        tool_explicit_none = Tool.from_tool(base_string_tool, output_schema=None)
+        assert tool_explicit_none.output_schema is None
 
-        # Different behavior at runtime
-        result_none = await tool_none.run({"x": 5})
-        result_false = await tool_false.run({"x": 5})
+        # Both should generate structured content now (via different paths)
+        result_default = await tool_default.run({"x": 5})
+        result_explicit_none = await tool_explicit_none.run({"x": 5})
 
-        assert result_none.structured_content == {
+        assert result_default.structured_content == {
             "result": "Result: 5"
         }  # Inherits wrapping
-        assert result_false.structured_content is None  # Disabled
-        assert result_none.content[0].text == result_false.content[0].text  # type: ignore[attr-defined]
+        assert result_explicit_none.structured_content == {
+            "result": "Result: 5"
+        }  # Generated via fallback logic
+        assert result_default.content[0].text == result_explicit_none.content[0].text  # type: ignore[attr-defined]
 
     async def test_transform_output_schema_with_tool_result_return(
         self, base_string_tool
@@ -1300,3 +1355,150 @@ class TestTransformToolOutputSchema:
         # Should use ToolResult content directly
         assert result.content[0].text == "Direct: 6"  # type: ignore[attr-defined]
         assert result.structured_content == {"direct_value": 6, "doubled": 12}
+
+
+@pytest.fixture
+def sample_tool():
+    """Sample tool for testing transformations."""
+
+    def sample_func(x: int) -> str:
+        return f"Result: {x}"
+
+    return Tool.from_function(
+        sample_func,
+        name="sample_tool",
+        title="Original Tool Title",
+        description="Original description",
+    )
+
+
+@pytest.fixture
+def sample_tool_no_title():
+    """Sample tool without title for testing."""
+
+    def sample_func(x: int) -> str:
+        return f"Result: {x}"
+
+    return Tool.from_function(sample_func, name="no_title_tool")
+
+
+def test_transform_inherits_title(sample_tool):
+    """Test that transformed tools inherit title when none specified."""
+    transformed = Tool.from_tool(sample_tool)
+    assert transformed.title == "Original Tool Title"
+
+
+def test_transform_overrides_title(sample_tool):
+    """Test that transformed tools can override title."""
+    transformed = Tool.from_tool(sample_tool, title="New Tool Title")
+    assert transformed.title == "New Tool Title"
+
+
+def test_transform_sets_title_to_none(sample_tool):
+    """Test that transformed tools can explicitly set title to None."""
+    transformed = Tool.from_tool(sample_tool, title=None)
+    assert transformed.title is None
+
+
+def test_transform_inherits_none_title(sample_tool_no_title):
+    """Test that transformed tools inherit None title."""
+    transformed = Tool.from_tool(sample_tool_no_title)
+    assert transformed.title is None
+
+
+def test_transform_adds_title_to_none(sample_tool_no_title):
+    """Test that transformed tools can add title when parent has None."""
+    transformed = Tool.from_tool(sample_tool_no_title, title="Added Title")
+    assert transformed.title == "Added Title"
+
+
+def test_transform_inherits_description(sample_tool):
+    """Test that transformed tools inherit description when none specified."""
+    transformed = Tool.from_tool(sample_tool)
+    assert transformed.description == "Original description"
+
+
+def test_transform_overrides_description(sample_tool):
+    """Test that transformed tools can override description."""
+    transformed = Tool.from_tool(sample_tool, description="New description")
+    assert transformed.description == "New description"
+
+
+def test_transform_sets_description_to_none(sample_tool):
+    """Test that transformed tools can explicitly set description to None."""
+    transformed = Tool.from_tool(sample_tool, description=None)
+    assert transformed.description is None
+
+
+def test_transform_inherits_none_description(sample_tool_no_title):
+    """Test that transformed tools inherit None description."""
+    transformed = Tool.from_tool(sample_tool_no_title)
+    assert transformed.description is None
+
+
+def test_transform_adds_description_to_none(sample_tool_no_title):
+    """Test that transformed tools can add description when parent has None."""
+    transformed = Tool.from_tool(sample_tool_no_title, description="Added description")
+    assert transformed.description == "Added description"
+
+
+# Meta transformation tests
+def test_transform_inherits_meta(sample_tool):
+    """Test that transformed tools inherit meta when none specified."""
+    sample_tool.meta = {"original": True, "version": "1.0"}
+    transformed = Tool.from_tool(sample_tool)
+    assert transformed.meta == {"original": True, "version": "1.0"}
+
+
+def test_transform_overrides_meta(sample_tool):
+    """Test that transformed tools can override meta."""
+    sample_tool.meta = {"original": True, "version": "1.0"}
+    transformed = Tool.from_tool(sample_tool, meta={"custom": True, "priority": "high"})
+    assert transformed.meta == {"custom": True, "priority": "high"}
+
+
+def test_transform_sets_meta_to_none(sample_tool):
+    """Test that transformed tools can explicitly set meta to None."""
+    sample_tool.meta = {"original": True, "version": "1.0"}
+    transformed = Tool.from_tool(sample_tool, meta=None)
+    assert transformed.meta is None
+
+
+def test_transform_inherits_none_meta(sample_tool_no_title):
+    """Test that transformed tools inherit None meta."""
+    sample_tool_no_title.meta = None
+    transformed = Tool.from_tool(sample_tool_no_title)
+    assert transformed.meta is None
+
+
+def test_transform_adds_meta_to_none(sample_tool_no_title):
+    """Test that transformed tools can add meta when parent has None."""
+    sample_tool_no_title.meta = None
+    transformed = Tool.from_tool(sample_tool_no_title, meta={"added": True})
+    assert transformed.meta == {"added": True}
+
+
+def test_tool_transform_config_inherits_meta(sample_tool):
+    """Test that ToolTransformConfig inherits meta when unset."""
+    sample_tool.meta = {"original": True, "version": "1.0"}
+    config = ToolTransformConfig(name="config_tool")
+    transformed = config.apply(sample_tool)
+    assert transformed.meta == {"original": True, "version": "1.0"}
+
+
+def test_tool_transform_config_overrides_meta(sample_tool):
+    """Test that ToolTransformConfig can override meta."""
+    sample_tool.meta = {"original": True, "version": "1.0"}
+    config = ToolTransformConfig(
+        name="config_tool", meta={"config": True, "priority": "high"}
+    )
+    transformed = config.apply(sample_tool)
+    assert transformed.meta == {"config": True, "priority": "high"}
+
+
+def test_tool_transform_config_removes_meta(sample_tool):
+    """Test that ToolTransformConfig can remove meta with None."""
+    sample_tool.meta = {"original": True, "version": "1.0"}
+    config = ToolTransformConfig(name="config_tool", meta=None)
+    transformed = config.apply(sample_tool)
+    assert transformed.meta is None

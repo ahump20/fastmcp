@@ -12,6 +12,8 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.tools import FunctionTool, ToolManager
 from fastmcp.tools.tool import Tool
+from fastmcp.tools.tool_transform import ArgTransformConfig, ToolTransformConfig
+from fastmcp.utilities.tests import caplog_for_fastmcp
 from fastmcp.utilities.types import Image
 
 
@@ -178,8 +180,10 @@ class TestAddTools:
 
         tool1 = Tool.from_function(test_fn, name="test_tool")
         manager.add_tool(tool1)
-        tool2 = Tool.from_function(test_fn, name="test_tool")
-        manager.add_tool(tool2)
+
+        with caplog_for_fastmcp(caplog):
+            tool2 = Tool.from_function(test_fn, name="test_tool")
+            manager.add_tool(tool2)
 
         assert "Tool already exists: test_tool" in caplog.text
         # Should have the tool
@@ -257,6 +261,52 @@ class TestAddTools:
         # Result should be the original tool
         assert isinstance(result, FunctionTool)
         assert result.fn.__name__ == "replacement_fn"
+
+
+class TestListTools:
+    async def test_list_tools_with_transformed_names(self):
+        """Test listing tools with transformations."""
+
+        tool_manager = ToolManager()
+
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        tool = Tool.from_function(add)
+        tool_manager.add_tool(tool)
+
+        tool_manager.add_tool_transformation(
+            "add", ToolTransformConfig(name="add_transformed")
+        )
+        tools = await tool_manager.list_tools()
+        tools_by_name = {tool.name: tool for tool in tools}
+        assert "add_transformed" in tools_by_name
+        assert "add" not in tools_by_name
+
+    async def test_list_tools_with_transforms(self):
+        """Test listing tools with transformations."""
+
+        tool_manager = ToolManager()
+
+        def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+        tool = Tool.from_function(add)
+        tool_manager.add_tool(tool)
+
+        tool_manager.add_tool_transformation(
+            "add",
+            ToolTransformConfig(
+                name="add_transformed", description=None, tags={"enabled_tools"}
+            ),
+        )
+        tools = await tool_manager.list_tools()
+        tools_by_name = {tool.name: tool for tool in tools}
+        assert "add_transformed" in tools_by_name
+        assert "add" not in tools_by_name
+        assert tools_by_name["add_transformed"].description is None
+        assert tools_by_name["add_transformed"].tags == {"enabled_tools"}
 
 
 class TestToolTags:
@@ -428,6 +478,39 @@ class TestCallTools:
         with pytest.raises(NotFoundError, match="Tool 'unknown' not found"):
             await manager.call_tool("unknown", {"a": 1})
 
+    async def test_call_transformed_tool(self):
+        manager = ToolManager()
+
+        def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+        tool = Tool.from_function(add)
+        manager.add_tool(tool)
+
+        manager.add_tool_transformation(
+            "add",
+            ToolTransformConfig(
+                name="add_transformed",
+                description=None,
+                tags={"enabled_tools"},
+                arguments={
+                    "a": ArgTransformConfig(
+                        name="a_transformed", description=None, default=1
+                    ),
+                    "b": ArgTransformConfig(
+                        name="b_transformed", description=None, default=2
+                    ),
+                },
+            ),
+        )
+
+        result = await manager.call_tool(
+            "add_transformed", {"a_transformed": 1, "b_transformed": 2}
+        )
+        assert result.content[0].text == "3"  # type: ignore[attr-defined]
+        assert result.structured_content == {"result": 3}
+
     async def test_call_tool_with_list_int_input(self):
         def sum_vals(vals: list[int]) -> int:
             return sum(vals)
@@ -486,7 +569,7 @@ class TestCallTools:
                 },
             )
 
-        assert result.content[0].text == '[\n  "rex",\n  "gertrude"\n]'  # type: ignore[attr-defined]
+        assert result.content[0].text == '["rex","gertrude"]'  # type: ignore[attr-defined]
         assert result.structured_content == {"result": ["rex", "gertrude"]}
 
     async def test_call_tool_with_custom_serializer(self):
@@ -751,8 +834,8 @@ class TestCustomToolNames:
         # Create a tool with a specific name
         tool = Tool.from_function(fn, name="my_tool")
         manager = ToolManager()
-        # Use with_key to create a new tool with the custom key
-        tool_with_custom_key = tool.with_key("proxy_tool")
+        # Use model_copy to create a new tool with the custom key
+        tool_with_custom_key = tool.model_copy(key="proxy_tool")
         manager.add_tool(tool_with_custom_key)
         # The tool is accessible under the key
         stored = await manager.get_tool("proxy_tool")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from importlib.metadata import version
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -11,21 +11,19 @@ from rich.text import Text
 import fastmcp
 
 if TYPE_CHECKING:
-    from typing import Literal
-
     from fastmcp import FastMCP
 
 LOGO_ASCII = r"""
-    _ __ ___ ______           __  __  _____________       ____    ____ 
-   _ __ ___ / ____/___ ______/ /_/  |/  / ____/ __ \     |___ \  / __ \
-  _ __ ___ / /_  / __ `/ ___/ __/ /|_/ / /   / /_/ /     ___/ / / / / /
- _ __ ___ / __/ / /_/ (__  ) /_/ /  / / /___/ ____/     /  __/_/ /_/ / 
-_ __ ___ /_/    \__,_/____/\__/_/  /_/\____/_/         /_____(_)____/  
+    _ __ ___ ______           __  __  _____________    ____    ____ 
+   _ __ ___ / ____/___ ______/ /_/  |/  / ____/ __ \  |___ \  / __ \
+  _ __ ___ / /_  / __ `/ ___/ __/ /|_/ / /   / /_/ /  ___/ / / / / /
+ _ __ ___ / __/ / /_/ (__  ) /_/ /  / / /___/ ____/  /  __/_/ /_/ / 
+_ __ ___ /_/    \__,_/____/\__/_/  /_/\____/_/      /_____(_)____/  
 
 """.lstrip("\n")
 
 
-def print_server_banner(
+def log_server_banner(
     server: FastMCP[Any],
     transport: Literal["stdio", "http", "sse", "streamable-http"],
     *,
@@ -33,7 +31,7 @@ def print_server_banner(
     port: int | None = None,
     path: str | None = None,
 ) -> None:
-    """Print a formatted banner with server information and logo.
+    """Creates and logs a formatted banner with server information and logo.
 
     Args:
         transport: The transport protocol being used
@@ -43,15 +41,14 @@ def print_server_banner(
         path: Server path (for HTTP transports)
     """
 
-    console = Console()
-
     # Create the logo text
     logo_text = Text(LOGO_ASCII, style="bold green")
 
     # Create the information table
     info_table = Table.grid(padding=(0, 1))
-    info_table.add_column(style="bold cyan", justify="left")
-    info_table.add_column(style="white", justify="left")
+    info_table.add_column(style="bold", justify="center")  # Emoji column
+    info_table.add_column(style="bold cyan", justify="left")  # Label column
+    info_table.add_column(style="white", justify="left")  # Value column
 
     match transport:
         case "http" | "streamable-http":
@@ -61,7 +58,8 @@ def print_server_banner(
         case "stdio":
             display_transport = "STDIO"
 
-    info_table.add_row("Transport:", display_transport)
+    info_table.add_row("🖥️", "Server name:", server.name)
+    info_table.add_row("📦", "Transport:", display_transport)
 
     # Show connection info based on transport
     if transport in ("http", "streamable-http", "sse"):
@@ -69,38 +67,36 @@ def print_server_banner(
             server_url = f"http://{host}:{port}"
             if path:
                 server_url += f"/{path.lstrip('/')}"
-            info_table.add_row("Server URL:", server_url)
+            info_table.add_row("🔗", "Server URL:", server_url)
 
     # Add documentation link
-    info_table.add_row()
-    info_table.add_row("Docs:", "https://gofastmcp.com")
-    info_table.add_row("Hosting:", "https://fastmcp.cloud")
+    info_table.add_row("", "", "")
+    info_table.add_row("📚", "Docs:", "https://gofastmcp.com")
+    info_table.add_row("🚀", "Deploy:", "https://fastmcp.cloud")
 
     # Add version information with explicit style overrides
-    info_table.add_row()
+    info_table.add_row("", "", "")
     info_table.add_row(
+        "🏎️",
         "FastMCP version:",
         Text(fastmcp.__version__, style="dim white", no_wrap=True),
     )
     info_table.add_row(
+        "🤝",
         "MCP version:",
         Text(version("mcp"), style="dim white", no_wrap=True),
     )
     # Create panel with logo and information using Group
     panel_content = Group(logo_text, "", info_table)
 
-    # Use server name in title if provided
-    title = "FastMCP 2.0"
-    if server.name != "FastMCP":
-        title += f" - {server.name}"
-
     panel = Panel(
         panel_content,
-        title=title,
+        title="FastMCP 2.0",
         title_align="left",
         border_style="dim",
-        padding=(2, 10),
+        padding=(1, 4),
         expand=False,
     )
 
-    console.print(panel)
+    console = Console(stderr=True)
+    console.print(Group("\n", panel, "\n"))

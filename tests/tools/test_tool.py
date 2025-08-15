@@ -15,6 +15,7 @@ from typing_extensions import TypedDict
 
 from fastmcp.tools.tool import Tool, _convert_to_content
 from fastmcp.utilities.json_schema import compress_schema
+from fastmcp.utilities.tests import caplog_for_fastmcp
 from fastmcp.utilities.types import Audio, File, Image
 
 
@@ -42,6 +43,22 @@ class TestToolFromFunction:
             "x-fastmcp-wrap-result": True,
         }
         assert tool.output_schema == expected_schema
+
+    def test_meta_parameter(self):
+        """Test that meta parameter is properly handled."""
+
+        def multiply(a: int, b: int) -> int:
+            """Multiply two numbers."""
+            return a * b
+
+        meta_data = {"version": "1.0", "author": "test"}
+        tool = Tool.from_function(multiply, meta=meta_data)
+
+        assert tool.meta == meta_data
+        mcp_tool = tool.to_mcp_tool()
+        # MCP tool includes fastmcp meta, so check that our meta is included
+        assert mcp_tool.meta is not None
+        assert meta_data.items() <= mcp_tool.meta.items()
 
     async def test_async_function(self):
         """Test registering and running an async function."""
@@ -545,14 +562,14 @@ class TestToolFromFunctionOutputSchema:
         def func() -> dict[str, str]:
             return {"message": "Hello, world!"}
 
-        tool = Tool.from_function(func, output_schema=False)
+        tool = Tool.from_function(func, output_schema=None)
         assert tool.output_schema is None
 
         result = await tool.run({})
         # Dict objects automatically become structured content even without schema
         assert result.structured_content == {"message": "Hello, world!"}
         assert len(result.content) == 1
-        assert result.content[0].text == '{\n  "message": "Hello, world!"\n}'  # type: ignore[attr-defined]
+        assert result.content[0].text == '{"message":"Hello, world!"}'  # type: ignore[attr-defined]
 
     async def test_output_schema_none_disables_structured_content(self):
         """Test that output_schema=None explicitly disables structured content."""
@@ -606,7 +623,7 @@ class TestToolFromFunctionOutputSchema:
         result = await tool.run({})
         # Dict result with object schema is used directly
         assert result.structured_content == {"value": 42}
-        assert result.content[0].text == '{\n  "value": 42\n}'  # type: ignore[attr-defined]
+        assert result.content[0].text == '{"value":42}'  # type: ignore[attr-defined]
 
     async def test_explicit_object_schema_with_non_dict_return_fails(self):
         """Test that explicit object schemas fail when function returns non-dict."""
@@ -712,17 +729,23 @@ class TestToolFromFunctionOutputSchema:
         tool_none = Tool.from_function(func, output_schema=None)
         assert tool_none.output_schema is None
 
-        # False should also disable
-        tool_false = Tool.from_function(func, output_schema=False)
-        assert tool_false.output_schema is None
+        # Default (NotSet) should infer from return type
+        tool_default = Tool.from_function(func)
+        assert (
+            tool_default.output_schema is not None
+        )  # Should infer schema from dict return type
 
-        # Both should have same behavior
+        # Different behavior: None vs inferred
         result_none = await tool_none.run({})
-        result_false = await tool_false.run({})
+        result_default = await tool_default.run({})
 
-        assert result_none.structured_content is None
-        assert result_false.structured_content is None
-        assert result_none.content[0].text == result_false.content[0].text == "123"  # type: ignore[attr-defined]
+        # None should still try fallback generation but fail for non-dict
+        assert result_none.structured_content is None  # Fallback fails for int
+        # Default should use proper schema and wrap the result
+        assert result_default.structured_content == {
+            "result": 123
+        }  # Schema-based generation with wrapping
+        assert result_none.content[0].text == result_default.content[0].text == "123"  # type: ignore[attr-defined]
 
     async def test_non_object_output_schema_raises_error(self):
         """Test that providing a non-object output schema raises a ValueError."""
@@ -858,7 +881,7 @@ class TestConvertResultToContent:
         assert isinstance(result, list)
         assert len(result) == 1
         assert isinstance(result[0], TextContent)
-        assert result[0].text == '{\n  "a": 1,\n  "b": 2\n}'
+        assert result[0].text == '{"a":1,"b":2}'
 
     def test_list_of_basic_types(self):
         """Test that a list of basic types is converted to a single TextContent."""
@@ -866,7 +889,7 @@ class TestConvertResultToContent:
         assert isinstance(result, list)
         assert len(result) == 1
         assert isinstance(result[0], TextContent)
-        assert result[0].text == '[\n  1,\n  "two",\n  {\n    "c": 3\n  }\n]'
+        assert result[0].text == '[1,"two",{"c":3}]'
 
     def test_list_of_mcp_types(self):
         """Test that a list of MCP types is returned as a list of those types."""
@@ -897,7 +920,7 @@ class TestConvertResultToContent:
         assert image_content_count == 1
 
         text_item = next(item for item in result if isinstance(item, TextContent))
-        assert text_item.text == '{\n  "a": 1\n}'
+        assert text_item.text == '[{"a":1}]'
 
         image_item = next(item for item in result if isinstance(item, ImageContent))
         assert image_item.data == "ZmFrZWltYWdlZGF0YQ=="
@@ -919,7 +942,7 @@ class TestConvertResultToContent:
         assert image_content_count == 1
 
         text_item = next(item for item in result if isinstance(item, TextContent))
-        assert text_item.text == '[\n  {\n    "a": 1\n  },\n  {\n    "b": 2\n  }\n]'
+        assert text_item.text == '[[{"a":1},{"b":2}]]'
 
         image_item = next(item for item in result if isinstance(item, ImageContent))
         assert image_item.data == "ZmFrZWltYWdlZGF0YQ=="
@@ -941,7 +964,7 @@ class TestConvertResultToContent:
         assert audio_content_count == 1
 
         text_item = next(item for item in result if isinstance(item, TextContent))
-        assert text_item.text == '{\n  "a": 1\n}'
+        assert text_item.text == '[{"a":1}]'
 
         audio_item = next(item for item in result if isinstance(item, AudioContent))
         assert audio_item.data == "ZmFrZWF1ZGlvZGF0YQ=="
@@ -966,7 +989,7 @@ class TestConvertResultToContent:
         assert embedded_content_count == 1
 
         text_item = next(item for item in result if isinstance(item, TextContent))
-        assert text_item.text == '{\n  "a": 1\n}'
+        assert text_item.text == '[{"a":1}]'
 
         embedded_item = next(
             item
@@ -1007,12 +1030,11 @@ class TestConvertResultToContent:
 
     def test_custom_serializer_error_fallback(self, caplog):
         """Test that if a custom serializer fails, it falls back to the default."""
-        import logging
 
         def custom_serializer_that_fails(data):
             raise ValueError("Serialization failed")
 
-        with caplog.at_level(logging.WARNING):
+        with caplog_for_fastmcp(caplog):
             result = _convert_to_content(
                 {"a": 1}, serializer=custom_serializer_that_fails
             )
@@ -1031,7 +1053,7 @@ class TestConvertResultToContent:
         assert isinstance(result, list)
         assert len(result) == 1
         assert isinstance(result[0], TextContent)
-        assert result[0].text == '[\n  1,\n  "two",\n  {\n    "c": 3\n  }\n]'
+        assert result[0].text == '[1,"two",{"c":3}]'
 
         content1 = TextContent(type="text", text="hello")
         result = _convert_to_content([1, content1], _process_as_single_item=True)
@@ -1043,6 +1065,30 @@ class TestConvertResultToContent:
             1,
             {"type": "text", "text": "hello", "annotations": None, "_meta": None},
         ]
+
+    def test_single_element_list_preserves_structure(self):
+        """Test that single-element lists preserve their list structure."""
+
+        # Test with a single integer
+        result = _convert_to_content([1])
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert result[0].text == "[1]"  # Should be "[1]", not "1"
+
+        # Test with a single string
+        result = _convert_to_content(["hello"])
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert result[0].text == '["hello"]'  # Should be ["hello"], not "hello"
+
+        # Test with a single dict
+        result = _convert_to_content([{"a": 1}])
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], TextContent)
+        assert result[0].text == '[{"a":1}]'  # Should be wrapped in a list
 
 
 class TestAutomaticStructuredContent:
@@ -1077,7 +1123,7 @@ class TestAutomaticStructuredContent:
             return UserProfile(name="Bob", age=25, email="bob@example.com")
 
         # No explicit output schema, but dataclass should still create structured content
-        tool = Tool.from_function(get_profile, output_schema=False)
+        tool = Tool.from_function(get_profile, output_schema=None)
 
         result = await tool.run({"user_id": "456"})
 
@@ -1104,8 +1150,8 @@ class TestAutomaticStructuredContent:
         def get_user_stats(user_id: str) -> UserData:
             return UserData(username="charlie", score=100, verified=True)
 
-        # Explicitly disable output schema to test automatic structured content
-        tool = Tool.from_function(get_user_stats, output_schema=False)
+        # Explicitly set output schema to None to test automatic structured content
+        tool = Tool.from_function(get_user_stats, output_schema=None)
 
         result = await tool.run({"user_id": "789"})
 
@@ -1265,6 +1311,88 @@ class TestUnionReturnTypes:
         # Test returning string
         result2 = await tool.run({"return_error": True})
         assert result2.structured_content == {"result": "error occurred"}
+
+
+class TestSerializationAlias:
+    """Tests for Pydantic field serialization alias support in tool output schemas."""
+
+    def test_output_schema_respects_serialization_alias(self):
+        """Test that Tool.from_function generates output schema using serialization alias."""
+        from pydantic import AliasChoices, BaseModel, Field
+
+        class Component(BaseModel):
+            """Model with multiple validation aliases but specific serialization alias."""
+
+            component_id: str = Field(
+                validation_alias=AliasChoices("id", "componentId"),
+                serialization_alias="componentId",
+                description="The ID of the component",
+            )
+
+        async def get_component(
+            component_id: str,
+        ) -> Annotated[Component, Field(description="The component.")]:
+            # API returns data with 'id' field
+            api_data = {"id": component_id}
+            return Component.model_validate(api_data)
+
+        tool = Tool.from_function(get_component, name="get-component")
+
+        # The output schema should use the serialization alias 'componentId'
+        # not the first validation alias 'id'
+        assert tool.output_schema is not None
+
+        # Check the wrapped result schema
+        assert "properties" in tool.output_schema
+        assert "result" in tool.output_schema["properties"]
+        assert "$defs" in tool.output_schema
+
+        # Find the Component definition
+        component_def = list(tool.output_schema["$defs"].values())[0]
+
+        # Should have 'componentId' not 'id' in properties
+        assert "componentId" in component_def["properties"]
+        assert "id" not in component_def["properties"]
+
+        # Should require 'componentId' not 'id'
+        assert "componentId" in component_def["required"]
+        assert "id" not in component_def.get("required", [])
+
+    async def test_tool_execution_with_serialization_alias(self):
+        """Test that tool execution works correctly with serialization aliases."""
+        from pydantic import AliasChoices, BaseModel, Field
+
+        from fastmcp import Client, FastMCP
+
+        class Component(BaseModel):
+            """Model with multiple validation aliases but specific serialization alias."""
+
+            component_id: str = Field(
+                validation_alias=AliasChoices("id", "componentId"),
+                serialization_alias="componentId",
+                description="The ID of the component",
+            )
+
+        mcp = FastMCP("TestServer")
+
+        @mcp.tool
+        async def get_component(
+            component_id: str,
+        ) -> Annotated[Component, Field(description="The component.")]:
+            # API returns data with 'id' field
+            api_data = {"id": component_id}
+            return Component.model_validate(api_data)
+
+        async with Client(mcp) as client:
+            # Execute the tool - this should work without validation errors
+            result = await client.call_tool(
+                "get_component", {"component_id": "test123"}
+            )
+
+            # The result should contain the serialized form with 'componentId'
+            assert result.structured_content is not None
+            assert result.structured_content["result"]["componentId"] == "test123"
+            assert "id" not in result.structured_content["result"]
 
 
 class TestToolTitle:

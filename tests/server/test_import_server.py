@@ -297,7 +297,7 @@ async def test_import_with_proxy_tools():
     def get_data(query: str) -> str:
         return f"Data for query: {query}"
 
-    proxy_app = FastMCP.as_proxy(Client(api_app))
+    proxy_app = FastMCP.as_proxy(api_app)
     await main_app.import_server(proxy_app, "api")
 
     async with Client(main_app) as client:
@@ -321,7 +321,7 @@ async def test_import_with_proxy_prompts():
         """Example greeting prompt."""
         return f"Hello, {name} from API!"
 
-    proxy_app = FastMCP.as_proxy(Client(api_app))
+    proxy_app = FastMCP.as_proxy(api_app)
     await main_app.import_server(proxy_app, "api")
 
     async with Client(main_app) as client:
@@ -349,7 +349,7 @@ async def test_import_with_proxy_resources():
             "base_url": "https://api.example.com",
         }
 
-    proxy_app = FastMCP.as_proxy(Client(api_app))
+    proxy_app = FastMCP.as_proxy(api_app)
     await main_app.import_server(proxy_app, "api")
 
     # Access the resource through the main app with the prefixed key
@@ -376,7 +376,7 @@ async def test_import_with_proxy_resource_templates():
     def create_user(name: str, email: str):
         return {"name": name, "email": email}
 
-    proxy_app = FastMCP.as_proxy(Client(api_app))
+    proxy_app = FastMCP.as_proxy(api_app)
     await main_app.import_server(proxy_app, "api")
 
     # Instantiate the template through the main app with the prefixed key
@@ -605,3 +605,41 @@ async def test_import_conflict_resolution_with_prefix():
 
         result = await client.call_tool("api_shared_tool", {})
         assert result.data == "Second app tool"
+
+
+async def test_import_server_resource_name_prefixing():
+    """Test that resource names are prefixed when using import_server."""
+    # Create a sub-server with a resource
+    sub_server = FastMCP("SubServer")
+
+    @sub_server.resource("resource://test_resource")
+    def test_resource() -> str:
+        return "Test content"
+
+    # Create main server and import sub-server with prefix
+    main_server = FastMCP("MainServer")
+    await main_server.import_server(sub_server, prefix="imported")
+
+    # Get resources and verify name prefixing
+    resources = await main_server.get_resources()
+    resource = resources["resource://imported/test_resource"]
+    assert resource.name == "imported_test_resource"
+
+
+async def test_import_server_resource_template_name_prefixing():
+    """Test that resource template names are prefixed when using import_server."""
+    # Create a sub-server with a resource template
+    sub_server = FastMCP("SubServer")
+
+    @sub_server.resource("resource://data/{item_id}")
+    def data_template(item_id: str) -> str:
+        return f"Data for {item_id}"
+
+    # Create main server and import sub-server with prefix
+    main_server = FastMCP("MainServer")
+    await main_server.import_server(sub_server, prefix="imported")
+
+    # Get resource templates and verify name prefixing
+    templates = await main_server.get_resource_templates()
+    template = templates["resource://imported/data/{item_id}"]
+    assert template.name == "imported_data_template"
